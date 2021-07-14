@@ -1,0 +1,517 @@
+---
+title: "Analysis of the road accidents in UK (2012-2014)"
+ 
+output:
+  distill::distill_article:
+    toc: true
+    toc_depth: 2
+---
+
+# Introduction
+
+Road accidents unfortunately are sad part of our life. In the paper below I will try to look into the data and find what are variable contributing to the amount of casualties in road accidents in UK. The data comes from the Kaggle website and can be found here [Link to dataset](https://www.kaggle.com/daveianhickey/2000-16-traffic-flow-england-scotland-wales).
+
+Data set consist only information collected from police reports therefore minor accidents are not included. Since data set is rather big (432 MB) I will use only small subset describing accidents between 2005 and 2007.
+
+Main objective is to understand how amount of casualties in accidents is dependent on conditions described by variables in the data set.
+
+# Data exploration
+
+**Loading libraries.**
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(themis)
+library(gt)
+library(visdat)
+library(vroom)
+library(janitor)
+library(vip)
+
+```
+
+**Loading data into RStudio.**
+
+Since csv file is of rather bigger size using ***vroom*** package makes sens.
+
+```{r}
+accidents_2012_to_2014 <- vroom("data/accidents_2012_to_2014.csv")
+
+```
+
+Quick look at the data
+
+```{r size="small"}
+accidents_2012_to_2014 %>% head(4) %>% gt(auto_align = T)
+```
+
+**Cleaning names**
+
+Column names are in non standard format therefore janitor package will used.
+
+```{r}
+accidents_2012_to_2014 <- accidents_2012_to_2014 %>% clean_names() 
+
+```
+
+Dimension check
+
+```{r}
+dim(accidents_2012_to_2014)
+
+```
+
+```{r}
+glimpse(accidents_2012_to_2014) 
+
+```
+
+Package **visdata** will help us to visualize data structure of the data set.
+
+```{r cache = T}
+vis_dat(accidents_2012_to_2014,warn_large_data = F) 
+
+```
+
+From the plot above we can see that most of data is in character and numeric format. Also column junction_detail is empty and junction_control column has significant amount of NA's.
+
+The next step will be to change data format characters to **factors** and characters **integers** ( or **doubles** ). Also i will take a closer look into junction_control column and drop empty junction_detail column.
+
+```{r cache = T}
+accidents_2012_to_2014 <- accidents_2012_to_2014 %>%
+  mutate_if(is.character, as.factor) %>%
+  # All characters to factors
+  mutate(date = lubridate::dmy(date)) %>%
+  # date column to date format
+  mutate_at(c(
+    "local_authority_district", "x1st_road_class", "accident_severity",
+    "x2nd_road_class", "urban_or_rural_area", "year", "speed_limit", "day_of_week"
+  ), as.factor) %>% 
+  # dropping junction_detail column 
+  select(-junction_detail)
+
+```
+
+Package **visdat** will help us with checking the number of NA values in the data set.
+
+```{r cache = T}
+vis_miss(accidents_2012_to_2014,warn_large_data = F)
+
+
+```
+
+Investigation of the junction_control column.
+
+```{r}
+accidents_2012_to_2014 %>% count(junction_control) %>% gt()
+```
+
+It looks like NA\`s in junction_control column are an effect of accidents which happened not in close proximity of any junction,
+
+```{r}
+accidents_2012_to_2014 <- accidents_2012_to_2014 %>%
+  mutate(junction_control =as.character(junction_control),
+         junction_control =replace_na(junction_control,"Not applay"),
+         junction_control =as.factor(junction_control)) 
+```
+
+Last check for remaining Na\`s.
+
+```{r}
+vis_miss(accidents_2012_to_2014,warn_large_data = F)
+
+```
+
+## Plotting data.
+
+```{r}
+accidents_2012_to_2014 %>% 
+  ggplot(aes(x= longitude,y=latitude))+
+  geom_point(color = "black",alpha = .02) +
+  theme_minimal()+
+  labs(title = "Traffic accidents in Uk 2012-2014")
+```
+
+```{r}
+accidents_2012_to_2014 %>% 
+  ggplot(aes(urban_or_rural_area)) +
+  geom_bar(fill = "black") +
+  scale_y_continuous(labels = scales::comma)+
+  theme_minimal()+
+    labs(title = "Urban (1) vs Rural(2)",
+         subtitle = "Traffic accidents count")
+```
+
+From the plot above we can see that twice as much accidents happens in urban area than rural.
+
+```{r}
+accidents_2012_to_2014 %>% 
+  ggplot(aes(number_of_casualties)) +
+  geom_histogram(fill = "black",color= "white") +
+  scale_y_continuous(labels = scales::comma, trans ="log10")+
+  theme_minimal()+
+    labs(title = "Histogram of number_of_casualties",
+         subtitle = "Log10 transformation")
+```
+
+Number of casualties is right skewed which can have an impact on model building process later on.
+
+```{r}
+accidents_2012_to_2014 %>% 
+  ggplot(aes(weather_conditions)) +
+  geom_bar(fill = "black",color= "white") +
+  scale_y_continuous(labels = scales::comma)+
+  theme_minimal()+
+  coord_flip()+
+    labs(title = "Weather condition.")
+```
+
+Looks like huge amount of accidents happens in normal conditions.
+
+```{r}
+accidents_2012_to_2014 %>% 
+  ggplot(aes(light_conditions)) +
+  geom_bar(fill = "black",color= "white") +
+  scale_y_continuous(labels = scales::comma)+
+  theme_minimal()+
+  coord_flip()+
+    labs(title = "Light condition.")
+```
+
+No surprises here. Most of the accidents happen during daylight. Possibly I could create new variable **daylight/darkness** based on the weather_condition column.
+
+# Model building.
+
+## Picking variables for the model.
+
+This are the variables which I decided to choose for the model. By no means this is a closed set and it can change in future depends on the results.
+
+```{r}
+accidents_df <-  accidents_2012_to_2014 %>% 
+  select(-accident_index,
+         -x1st_road_number,
+         -x2nd_road_number,
+         -did_police_officer_attend_scene_of_accident,
+         -location_easting_osgr,
+         -location_northing_osgr,
+         -local_authority_highway,
+         -lsoa_of_accident_location,
+         -police_force,
+         -local_authority_district,
+         -x1st_road_class,
+         -x2nd_road_class,
+         -accident_severity) %>% 
+  mutate(h_of_accident = lubridate::hour(time),# extracting hour only from time column.
+         month_of_accident = lubridate::month(date)) %>%  # extracting month only from time column.
+  select(-date,-time) %>% 
+  drop_na()
+```
+
+## Target variable.
+
+We will try to understand if conditions captured in the variables can predict if number of casualties in greater than 1.
+
+```{r}
+accidents_df <-  accidents_df %>% 
+  mutate(number_of_casualties = if_else(number_of_casualties == 1, "one","more")) 
+```
+
+Quick check revels that target variable highly unbalanced. This will have to be addressed later.
+
+```{r}
+accidents_df %>% 
+  ggplot(aes(number_of_casualties))+
+  geom_bar(fill = "black",show.legend = F)+
+  scale_y_continuous(labels = scales::comma)+
+  theme_minimal()
+```
+
+## Initial data split
+
+Data split with stratification set to number_of_casualties.
+
+```{r}
+df_split <- initial_split(accidents_df,strata = number_of_casualties )
+
+```
+
+Creating **training set.**
+
+```{r}
+data_train <- training(df_split)
+
+```
+
+Creating **testing set.**
+
+```{r}
+data_test <- testing(df_split)
+
+```
+
+## Data preprocessing with recepies.
+
+Preparation of data for modeling. Removing NA\`s, zero variance observation, and down sampling based on outcome variable.
+
+```{r}
+accidents_rec <- 
+  recipe(number_of_casualties ~.,data = data_train) %>% 
+  step_normalize(all_numeric(), -all_outcomes()) %>% 
+  step_dummy(all_nominal(), -all_outcomes()) %>% 
+  step_zv(all_numeric(),-all_outcomes(),) %>% 
+  step_downsample(all_outcomes())
+```
+
+Quick check that unbalanced data problem is solved.
+
+```{r}
+accidents_rec %>% prep() %>% juice() %>% count(number_of_casualties)
+```
+
+## Cross validation sets.
+
+```{r}
+cv_folds <- vfold_cv(data_train, v = 5, strata = number_of_casualties)
+```
+
+## Building models specifications.
+
+I will try three models:
+
+-   logistic regression
+
+-   random forest
+
+-   xgboost
+
+### Model specification for logistic regression.
+
+```{r}
+log_spec <- 
+  logistic_reg() %>% 
+  set_engine("glm") %>% 
+  set_mode("classification")
+
+```
+
+### Model specification for random forest.
+
+```{r}
+rf_spec <- 
+  rand_forest() %>% 
+  set_engine("ranger",importance = "impurity") %>% 
+  set_mode("classification")
+
+```
+
+### Model specification for xgboost.
+
+```{r}
+xgb_spec <-
+  boost_tree() %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+```
+
+## Building workflows.
+
+### Logistic regression workflow
+
+```{r}
+log_workflow <- 
+  workflow() %>% 
+  add_recipe(accidents_rec) %>% 
+  add_model(log_spec)
+```
+
+### Random forest workflow.
+
+```{r}
+rf_workflow <- 
+  workflow() %>% 
+  add_recipe(accidents_rec) %>% 
+  add_model(rf_spec)
+
+```
+
+### Xgboost workflow.
+
+```{r}
+xgb_workflow <- 
+  workflow() %>% 
+  add_recipe(accidents_rec) %>% 
+  add_model(xgb_spec)
+```
+
+## Fitting re-samples.
+
+### Fitting logistic regression workflow
+
+```{r}
+log_res <- 
+  log_workflow %>% 
+  fit_resamples(
+    resamples = cv_folds, 
+    metrics = metric_set(
+      accuracy,
+      roc_auc, 
+      sens,
+      specificity),
+    control = control_resamples(
+      save_pred = TRUE)
+    ) 
+
+```
+
+### Fitting Random Forrest workflow.
+
+```{r}
+rf_res <- 
+  rf_workflow %>% 
+  fit_resamples(
+    resamples = cv_folds, 
+    metrics = metric_set(
+     accuracy, 
+      roc_auc, 
+      sens,
+      specificity),
+    control = control_resamples(
+      save_pred = TRUE)
+    ) 
+```
+
+```{r}
+rf_res
+```
+
+### Fitting xgboost workflow
+
+```{r}
+xgb_res <- 
+  xgb_workflow %>% 
+  fit_resamples(
+    resamples = cv_folds, 
+    metrics = metric_set(
+      accuracy,
+      roc_auc, 
+      sens,
+      specificity),
+    control = control_resamples(
+      save_pred = TRUE)
+    ) 
+```
+
+### Collecting metrics
+
+```{r}
+models_comp <- bind_rows(
+rf_res %>%  collect_metrics(summarize =T) %>% 
+  mutate(model = "Random Forest"),
+log_res %>%  collect_metrics() %>% 
+  mutate(model = "Logistic Regression"),
+xgb_res %>% collect_metrics() %>% 
+  mutate(model = "XGBoost" )
+) %>% 
+  select(model, .metric,mean) %>% 
+  pivot_wider(names_from = model,values_from = mean)
+
+
+```
+
+Comparing metrics for three models
+
+```{r}
+models_comp %>% gt()
+```
+
+**Plotting results**
+
+```{r}
+models_comp %>% 
+  filter(.metric == "sens") %>% 
+  pivot_longer(names_to = "model",values_to = "mean",cols = c(-.metric)) %>% 
+  ggplot(aes(model,mean))+
+  geom_col(aes(fill = mean))+
+  coord_flip()+
+  geom_text(aes(label = round(mean,2)), vjust=1)+
+  theme_minimal()+
+  labs(title = "Comparison of the Sensitivity.")
+```
+
+```{r}
+models_comp %>% 
+  filter(.metric == "spec") %>% 
+  pivot_longer(names_to = "model",values_to = "mean",cols = c(-.metric)) %>% 
+  ggplot(aes(model,mean))+
+  geom_col(aes(fill = mean),show.legend = F)+
+  coord_flip()+
+  geom_text(aes(label = round(mean,2)), vjust=1)+
+  theme_minimal()+
+  labs(title = "Comparison of the Specificity")
+```
+
+```{r}
+models_comp %>% 
+  filter(.metric == "roc_auc") %>% 
+  pivot_longer(names_to = "model",values_to = "mean",cols = c(-.metric)) %>% 
+  ggplot(aes(model,mean))+
+  geom_col(aes(fill = mean))+
+  coord_flip()+
+  geom_text(aes(label = round(mean,2)), vjust=1)+
+  theme_minimal()+
+  labs(title= "ROC_AUC")
+```
+
+Based on plots above I decide to choose Random Forest model for final fit.
+
+# Last evaluation of the Random Forest model.
+
+```{r}
+last_fit_rf <- last_fit(rf_workflow,split = df_split,
+         metrics = metric_set(sens,roc_auc),save_pred = T)
+
+
+```
+
+Collecting metrics for last fit.
+
+```{r}
+last_fit_rf %>% collect_metrics() %>% gt()
+
+```
+
+Since the metrics of the last fit looks similar to metrics from the validation set we would have pretty high confidence that our model would do good job in predicting target variable supplied with new data,
+
+# Variable importance.
+
+```{r}
+last_fit_rf %>% 
+  pluck(".workflow",1) %>% 
+  pull_workflow_fit() %>% 
+  vip(fill = "black")+
+  theme_minimal()
+```
+
+```{r}
+last_fit_rf %>% 
+  collect_predictions() %>% 
+  roc_curve(number_of_casualties, .pred_more) %>% 
+  autoplot()+
+  theme_minimal()
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  fig.align = T,
+  out.width = "90%",
+  warning = FALSE,
+  message = FALSE,
+  tidy = TRUE)
+```
+
+```{r}
+
+```
+
